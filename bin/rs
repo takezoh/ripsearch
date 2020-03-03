@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+# coding: utf-8
+import os
+import sys
+import shutil
+import platform
+import subprocess
+from importlib import import_module, machinery
+
+
+CONFIG_HOME = os.environ.get('XDG_CONFIG_HOME', f'''{os.path.join(os.environ['HOME'], '.config')}''')
+
+class DefaultConfig():
+    BINDINGS = {}
+    RAW_BINDINGS = {}
+    RG_ARGS = ['--ignore-case']
+    FZF_ARGS = ['-e', '--multi', '--no-sort', '--exit-0', '--reverse', '--inline-info']
+    BAT_HIGHLIGHT_THEME = 'zenburn'
+    SHOW_FILEPATH = True
+
+    HIGHLIGHT_STYLE = u'\u001b[38;5;253;48;5;163;01m{}\u001b[00m'
+    FILEPATH_STYLE = u'\u001b[37;40;1;4m> {}\u001b[0m'
+    SOURCE_HIGHLIGHTER = 'src-highlight.sh'
+    USE_RANGE_HIGHLIGHT = True
+
+
+class Config():
+    def __init__(self):
+        self.default_config = DefaultConfig()
+        try:
+            loader = machinery.SourceFileLoader('ripsearch.config', os.path.join(CONFIG_HOME, 'ripsearch', 'config'))
+            self.user_config = loader.load_module()
+            self.__class__.USE_RANGE_HIGHLIGHT = 'SOURCE_HIGHLIGHTER' not in self.user_config.__dict__
+        except FileNotFoundError:
+            self.user_config = None
+
+    def __getattr__(self, name):
+        if self.user_config and name in self.user_config.__dict__:
+            return self.user_config.__dict__[name]
+        return self.default_config.__class__.__dict__[name]
+
+
+config = Config()
+
+
+class Handler():
+    def preview(self):
+        out = []
+        offset = 0
+        window_lines = shutil.get_terminal_size().lines
+        if platform.system().lower() == 'darwin':
+            window_lines = window_lines // 2 - 2
+        linenumber = self.linenumber - 1
+
+        if config.SHOW_FILEPATH:
+            offset += 1
+            window_lines -= 1
+            out.append(config.FILEPATH_STYLE.format(self.filepath))
+
+        head = 0
+        highlight_args = [config.SOURCE_HIGHLIGHTER, self.filepath]
+
+        if config.USE_RANGE_HIGHLIGHT:
+            head = max(linenumber - (window_lines - 1), 0)
+            tail = linenumber + (window_lines - 1)
+            highlight_args = ['bat', '--style=plain', f'--theme={config.BAT_HIGHLIGHT_THEME}', '--color=always', '--unbuffered', '--line-range', f'{head+1}:{tail+1}', self.filepath]
+
+        p = subprocess.run(highlight_args, stdout=subprocess.PIPE, shell=False)
+        p.check_returncode()
+
+        context = p.stdout.decode('utf-8').rstrip().replace('\r\n', '\n').split('\n')
+        context_lines = len(context)
+        context_offset = max(min(linenumber - window_lines // 2 - head, context_lines - window_lines), 0)
+        context[linenumber - head] = config.HIGHLIGHT_STYLE.format(self.text.rstrip())
+        out[offset:] = context[context_offset:context_offset+window_lines]
+        print ('\n'.join(out).replace('\t', '  '))
+
+    def bind(self, bind):
+        _, command = config.BINDINGS[bind]
+        if callable(command):
+            command(filepath=self.filepath, linenumber=self.linenumber, text=self.text)
+        else:
+            command = command.format(filepath=self.filepath, linenumber=self.linenumber, text=self.text)
+            p = subprocess.run(command, shell=True)
+            p.check_returncode()
+
+    def __init__(self, rg_line):
+        self.filepath, self.linenumber, self.text = rg_line.split(':', 2)
+        self.linenumber = int(self.linenumber)
+
+    def execute(self, name, *args):
+        getattr(self, name)(*args)
+
+
+class Program():
+    PROGRAM = os.path.abspath(__file__)
+    HANDLE_OPTION_NAME = '--g-handle'
+
+    def main(self, args):
+        def make_bindings():
+            duplicate_keys = set(config.BINDINGS.keys()) & set(config.RAW_BINDINGS.keys())
+            if duplicate_keys:
+                raise ValueError(f'duplicate binding keys: {duplicate_keys}')
+
+            raw_bins = [f'{bind}:{value}' for bind, value in config.RAW_BINDINGS.items()]
+            bins = [f'{bind}:{func}({self.PROGRAM} {self.HANDLE_OPTION_NAME} {{}} bind {bind})' for bind, (func, _) in config.BINDINGS.items()]
+            if raw_bins or bins:
+                return ['--bind', ','.join(raw_bins + bins)]
+            return []
+
+        rg_args = ['rg',
+            '--line-number',
+            ] + config.RG_ARGS + args + [
+            '.',
+            ]
+
+        fzf_args = ['fzf',
+            '--prompt={} > '.format(' '.join(args)),
+            '--preview', f'{self.PROGRAM} {self.HANDLE_OPTION_NAME} {{}} preview',
+            '--preview-window', 'up',
+            ] + config.FZF_ARGS + make_bindings()
+
+        try:
+            p_rg = subprocess.Popen(rg_args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, shell=False)
+            p_fzf = subprocess.run(fzf_args, stdin=p_rg.stdout, shell=False)
+            p_fzf.check_returncode()
+        except subprocess.CalledProcessError as e:
+            if e.returncode in (
+                    1,  # exit-0
+                    130,  # SIGINT
+                    ):
+                sys.exit(e.returncode)
+            raise e
+        finally:
+            p_rg.terminate()
+
+    def run(self, args):
+        if len(args) > 0 and args[0] == self.HANDLE_OPTION_NAME:
+            Handler(args[1]).execute(args[2], *args[3:])
+        else:
+            self.main(args)
+
+
+if __name__ == '__main__':
+    Program().run(sys.argv[1:])
